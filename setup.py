@@ -25,7 +25,9 @@ from _build_config import (
     detect_adaptor,
     detect_torch_flag,
     get_device_config,
+    get_device_rpath_dirs,
     get_ext_classes,
+    resolve_torch_backend,
 )
 
 # ---------------------------------------------------------------------------
@@ -38,6 +40,9 @@ print(f"[flagcx] Using {adaptor} adaptor")
 adaptor_flag = ADAPTOR_MAP[adaptor]
 adaptor_make_flag = ADAPTOR_TO_MAKE_FLAG[adaptor]
 torch_flag = detect_torch_flag()
+torch_backend = resolve_torch_backend(adaptor)
+torch_backend_flags = list(torch_backend.compile_flags)
+print(f"[flagcx] Using {torch_backend.name} torch backend")
 
 # ---------------------------------------------------------------------------
 # Extension sources and include dirs
@@ -48,10 +53,15 @@ sources = [
     os.path.join("plugin", "torch", "flagcx", "src", "utils_flagcx.cpp"),
 ]
 
+VENDORED_JSON_INCLUDE_DIR = os.path.join(
+    ROOT_DIR, "third-party", "json", "single_include"
+)
+JSON_INCLUDE_DIR = os.environ.get("JSON_INCLUDE_DIR") or VENDORED_JSON_INCLUDE_DIR
+
 include_dirs = [
     os.path.join(PLUGIN_DIR, "flagcx", "include"),
     os.path.join(ROOT_DIR, "flagcx", "include"),
-    os.path.join(ROOT_DIR, "third-party", "json", "single_include"),
+    JSON_INCLUDE_DIR,
 ]
 
 # Will be updated in build_ext to point at the built libflagcx.so
@@ -59,7 +69,9 @@ library_dirs = []
 libs = ["flagcx"]
 
 # Add device-specific paths
-dev_includes, dev_libdirs, dev_libs = get_device_config(adaptor_flag)
+dev_includes, dev_libdirs, dev_libs = get_device_config(
+    adaptor_flag, torch_backend
+)
 include_dirs += dev_includes
 library_dirs += dev_libdirs
 libs += dev_libs
@@ -77,22 +89,31 @@ CppExtension, BuildExtension = get_ext_classes(adaptor_flag)
 if BuildExtension is not None:
     class BuildExtWithMake(BuildExtension):
         def build_extensions(self):
-            # -- Step 0: Ensure git submodules are initialized --
-            submodule_marker = os.path.join(
-                ROOT_DIR, "third-party", "json", "single_include"
-            )
-            if not os.path.isdir(submodule_marker):
+            # -- Step 0: Resolve nlohmann-json headers --
+            json_header = os.path.join(JSON_INCLUDE_DIR, "nlohmann", "json.hpp")
+            if (
+                JSON_INCLUDE_DIR == VENDORED_JSON_INCLUDE_DIR
+                and not os.path.isfile(json_header)
+            ):
                 print("[flagcx] Initializing git submodules ...")
                 subprocess.check_call(
                     ["git", "submodule", "update", "--init", "--recursive"],
                     cwd=ROOT_DIR,
+                )
+            if not os.path.isfile(json_header):
+                raise RuntimeError(
+                    f"nlohmann/json.hpp not found under JSON_INCLUDE_DIR={JSON_INCLUDE_DIR}"
                 )
 
             # -- Step 1: Build libflagcx.so via make --
             build_dir = os.path.join(ROOT_DIR, "build")
             lib_dir = os.path.join(build_dir, "lib")
 
-            make_args = [f"BUILDDIR={build_dir}", f"{adaptor_make_flag}=1"]
+            make_args = [
+                f"BUILDDIR={build_dir}",
+                f"{adaptor_make_flag}=1",
+                f"JSON_INCLUDE_DIR={JSON_INCLUDE_DIR}",
+            ]
 
             # Forward additional env vars to make
             env_to_make = [
@@ -119,7 +140,12 @@ if BuildExtension is not None:
                 # Set $ORIGIN rpath so _C.so finds libflagcx.so in the same directory
                 # Preserve device-specific rpaths so runtime linker can find device libs
                 origin_rpath = "-Wl,-rpath,$ORIGIN"
-                dev_rpaths = ["-Wl,-rpath," + d for d in dev_libdirs]
+                dev_rpaths = [
+                    "-Wl,-rpath," + d
+                    for d in get_device_rpath_dirs(
+                        adaptor_flag, dev_libdirs, torch_backend
+                    )
+                ]
                 ext.extra_link_args = [
                     arg for arg in ext.extra_link_args
                     if not arg.startswith("-Wl,-rpath,")
@@ -157,7 +183,9 @@ if CppExtension is not None:
         name="flagcx._C",
         sources=sources,
         include_dirs=include_dirs,
-        extra_compile_args={"cxx": [adaptor_flag, torch_flag]},
+        extra_compile_args={
+            "cxx": [adaptor_flag, torch_flag] + torch_backend_flags
+        },
         extra_link_args=[],
         library_dirs=library_dirs,
         libraries=libs,
@@ -177,7 +205,7 @@ os.makedirs(os.path.join(ROOT_DIR, "build"), exist_ok=True)
 
 setup(
     name="flagcx",
-    version="0.10.0",
+    version="0.13.0",
     description="FlagCX: A unified collective communication library",
     package_dir={"flagcx": "plugin/torch/flagcx"},
     packages=["flagcx"],

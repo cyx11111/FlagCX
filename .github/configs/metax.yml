@@ -1,0 +1,34 @@
+# MetaX Hardware Configuration
+hardware_name: metax
+display_name: MetaX Tests
+
+ci_image: harbor.baai.ac.cn/flagos-dev/flagcx:3016346-metax-dev
+
+runner_labels:
+  - mx-8g-cicd-flagcx
+
+docker_volumes:
+  - /opt/mxdriver:/opt/mxdriver:ro
+
+docker_options:
+  - --network=host
+  - --hostname=te-cicd
+  - --ipc=host
+  - --privileged=true
+  - --shm-size=100gb
+  - --ulimit=memlock=-1
+  - --ulimit=nofile=65535:65535
+  - --group-add=video
+  - --env=PLATFORM=metax
+  - --env=TORCH_DISTRIBUTED_BACKEND=mccl
+
+set_env: .github/scripts/set_env/metax.sh
+
+unit_test_suites:
+  - adaptor
+  - core
+  - p2p
+  - rma
+  - runner
+  - service
+  - symmem

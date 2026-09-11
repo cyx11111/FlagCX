@@ -8,16 +8,18 @@
 #include "comm.h"
 #include "cost_model.h"
 #include "flagcx_hetero.h"
-#include "flagcx_kernel.h"
+#include "flagcx_kernel_internal.h"
 #include "flagcx_net.h"
 #include "ib_common.h"
 #include "launch_kernel.h"
+#include "mem_alloc_registry.h"
 #include "net.h"
 #include "onesided.h"
 #include "param.h"
 #include "proxy.h"
 #include "reg_pool.h"
 #include "runner.h"
+#include "shmem_adaptor.h"
 #include "sym_heap.h"
 #include "timer.h"
 #include "transport.h"
@@ -27,6 +29,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <vector>
 
 flagcxRegPool globalRegPool;
 
@@ -85,7 +88,7 @@ static struct flagcxDeviceHandle globalDeviceHandle {
       // Event functions
       deviceAdaptor->eventCreate, deviceAdaptor->eventDestroy,
       deviceAdaptor->eventRecord, deviceAdaptor->eventSynchronize,
-      deviceAdaptor->eventQuery,
+      deviceAdaptor->eventQuery, deviceAdaptor->eventElapsedTime,
       // IpcMemHandle functions
       deviceAdaptor->ipcMemHandleCreate, deviceAdaptor->ipcMemHandleGet,
       deviceAdaptor->ipcMemHandleOpen, deviceAdaptor->ipcMemHandleClose,
@@ -118,6 +121,7 @@ void flagcxRebuildGlobalDeviceHandle() {
   globalDeviceHandle.eventRecord = deviceAdaptor->eventRecord;
   globalDeviceHandle.eventSynchronize = deviceAdaptor->eventSynchronize;
   globalDeviceHandle.eventQuery = deviceAdaptor->eventQuery;
+  globalDeviceHandle.eventElapsedTime = deviceAdaptor->eventElapsedTime;
   // IpcMemHandle functions
   globalDeviceHandle.ipcMemHandleCreate = deviceAdaptor->ipcMemHandleCreate;
   globalDeviceHandle.ipcMemHandleGet = deviceAdaptor->ipcMemHandleGet;
@@ -215,38 +219,134 @@ flagcxResult_t flagcxHandleFree(flagcxHandlerGroup_t handler) {
   return flagcxSuccess;
 }
 
-FLAGCX_PARAM(MemEnable, "MEM_ENABLE", 0);
+static flagcxResult_t flagcxMemFreeByBackend(void *ptr,
+                                             flagcxMemAllocBackend_t backend) {
+  switch (backend) {
+    case flagcxMemAllocBackendNative:
+      if (deviceAdaptor == nullptr || deviceAdaptor->gdrMemFree == nullptr) {
+        WARN("flagcxMemFree: native allocator is not available");
+        return flagcxInternalError;
+      }
+      return deviceAdaptor->gdrMemFree(ptr, nullptr);
+    case flagcxMemAllocBackendCcl:
+      if (cclAdaptors[flagcxCCLAdaptorDevice] == nullptr ||
+          cclAdaptors[flagcxCCLAdaptorDevice]->memFree == nullptr) {
+        WARN("flagcxMemFree: CCL allocator is not available");
+        return flagcxInternalError;
+      }
+      return cclAdaptors[flagcxCCLAdaptorDevice]->memFree(ptr);
+    case flagcxMemAllocBackendShmem:
+      if (shmemAdaptor == nullptr || shmemAdaptor->free == nullptr) {
+        WARN("flagcxMemFree: SHMEM allocator is not available");
+        return flagcxInternalError;
+      }
+      return shmemAdaptor->free(ptr);
+    default:
+      WARN("flagcxMemFree: unknown allocation backend %d", (int)backend);
+      return flagcxInvalidArgument;
+  }
+}
 
-flagcxResult_t flagcxMemAlloc(void **ptr, size_t size) {
+flagcxResult_t flagcxMemAlloc(void **ptr, size_t size,
+                              flagcxMemAllocator_t allocator) {
   if (ptr == NULL || size == 0) {
     WARN("Invalid ptr(NULL) or size(0) for allocation.");
     return flagcxInvalidArgument;
   }
-  if (flagcxParamMemEnable()) {
-    FLAGCXCHECK(deviceAdaptor->gdrMemAlloc(ptr, size, NULL));
-    if (*ptr != NULL) {
-      INFO(FLAGCX_REG, "flagcxMemAlloc: GDR allocated [%p, %ld]", *ptr, size);
-    } else {
-      WARN("flagcxMemAlloc: GDR allocation failed");
-      return flagcxUnhandledDeviceError;
-    }
-  } else {
-    FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorDevice]->memAlloc(ptr, size));
+  *ptr = nullptr;
+
+  flagcxResult_t res = flagcxSuccess;
+  flagcxMemAllocBackend_t backend = flagcxMemAllocBackendNative;
+  switch (allocator) {
+    case flagcxMemCCL:
+      if (useHeteroComm()) {
+        backend = flagcxMemAllocBackendNative;
+        if (deviceAdaptor == nullptr || deviceAdaptor->gdrMemAlloc == nullptr) {
+          WARN("flagcxMemAlloc: native allocator is not available");
+          return flagcxInternalError;
+        }
+        res = deviceAdaptor->gdrMemAlloc(ptr, size, nullptr);
+      } else {
+        backend = flagcxMemAllocBackendCcl;
+        if (cclAdaptors[flagcxCCLAdaptorDevice] == nullptr ||
+            cclAdaptors[flagcxCCLAdaptorDevice]->memAlloc == nullptr) {
+          WARN("flagcxMemAlloc: CCL allocator is not available");
+          return flagcxInternalError;
+        }
+        res = cclAdaptors[flagcxCCLAdaptorDevice]->memAlloc(ptr, size);
+      }
+      break;
+    case flagcxMemSHMEM:
+      backend = flagcxMemAllocBackendShmem;
+      if (shmemAdaptor == nullptr || shmemAdaptor->malloc == nullptr) {
+        WARN("flagcxMemAlloc: SHMEM allocator is not available");
+        return flagcxInternalError;
+      }
+      res = shmemAdaptor->malloc(ptr, size);
+      break;
+    default:
+      WARN("flagcxMemAlloc: unknown allocator %d", (int)allocator);
+      return flagcxInvalidArgument;
   }
+
+  if (res != flagcxSuccess) {
+    if (*ptr != nullptr) {
+      flagcxResult_t freeRes = flagcxMemFreeByBackend(*ptr, backend);
+      if (freeRes != flagcxSuccess)
+        WARN("flagcxMemAlloc: failed to roll back partial allocation");
+      *ptr = nullptr;
+    }
+    return res;
+  }
+  if (*ptr == nullptr) {
+    WARN("flagcxMemAlloc: backend %d returned a null pointer", (int)backend);
+    return flagcxUnhandledDeviceError;
+  }
+
+  flagcxMemAllocationInfo info{*ptr, size, allocator, backend};
+  res = globalMemAllocRegistry.insert(info);
+  if (res != flagcxSuccess) {
+    flagcxResult_t freeRes = flagcxMemFreeByBackend(*ptr, backend);
+    if (freeRes != flagcxSuccess)
+      WARN("flagcxMemAlloc: failed to roll back untracked allocation");
+    *ptr = nullptr;
+    return res;
+  }
+
   return flagcxSuccess;
 }
 
-flagcxResult_t flagcxMemFree(void *ptr) {
+flagcxResult_t flagcxMemFree(void *ptr, flagcxMemAllocator_t allocator) {
   if (ptr == NULL) {
     WARN("Invalid pointer(=NULL) for de-allocation.");
     return flagcxSuccess;
   }
-  if (flagcxParamMemEnable()) {
-    FLAGCXCHECK(deviceAdaptor->gdrMemFree(ptr, NULL));
-    INFO(FLAGCX_REG, "flagcxMemFree: GDR memory deallocated");
-  } else {
-    FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorDevice]->memFree(ptr));
+
+  flagcxMemAllocationInfo info;
+  flagcxResult_t res = globalMemAllocRegistry.findExact(ptr, &info);
+  if (res != flagcxSuccess) {
+    WARN("flagcxMemFree: pointer was not allocated by flagcxMemAlloc");
+    return flagcxInvalidUsage;
   }
+  if (allocator != info.allocator) {
+    WARN("flagcxMemFree: allocator mismatch (requested %d, recorded %d)",
+         (int)allocator, (int)info.allocator);
+    return flagcxInvalidUsage;
+  }
+
+  // Remove ownership before calling the backend so concurrent frees cannot
+  // both release the same allocation. Restore it if the backend rejects the
+  // free and still owns the memory.
+  FLAGCXCHECK(globalMemAllocRegistry.erase(ptr));
+  res = flagcxMemFreeByBackend(ptr, info.backend);
+  if (res != flagcxSuccess) {
+    flagcxResult_t restoreRes = globalMemAllocRegistry.insert(info);
+    if (restoreRes != flagcxSuccess)
+      WARN("flagcxMemFree: failed to restore allocation provenance");
+    return res;
+  }
+  INFO(FLAGCX_REG, "flagcxMemFree: backend %d memory deallocated",
+       (int)info.backend);
   return flagcxSuccess;
 }
 
@@ -414,6 +514,74 @@ fail:
   info->fullRecvComms = NULL;
   info->nRanks = 0;
   info->nContexts = 0;
+  return res;
+}
+
+// Ensure full-mesh one-sided connections exist for this heteroComm.
+// If no data handle has been registered yet, lazily build a connection-only
+// handle at slot 0 so that signal/staging registration can proceed without
+// requiring a prior flagcxCommRegister call.
+// NOTE: This is a collective operation — all ranks must call it together.
+static flagcxResult_t
+flagcxOneSideEnsureFullMesh(struct flagcxHeteroComm *heteroComm) {
+  if (heteroComm == NULL || heteroComm->netAdaptor == NULL ||
+      heteroComm->netAdaptor->regMr == NULL)
+    return flagcxNotSupported;
+
+  // Already have connections?
+  if (heteroComm->oneSideHandleCount > 0 &&
+      heteroComm->oneSideHandles[0] != NULL &&
+      heteroComm->oneSideHandles[0]->fullRecvComms != NULL) {
+    return flagcxSuccess;
+  }
+
+  if (heteroComm->bootstrap == NULL)
+    return flagcxNotSupported;
+
+  flagcxResult_t res = flagcxSuccess;
+  struct flagcxOneSideHandleInfo *info = NULL;
+
+  // Grow array if needed
+  if (heteroComm->oneSideHandleCount >= heteroComm->oneSideHandleCapacity) {
+    int newCap = heteroComm->oneSideHandleCapacity == 0
+                     ? 4
+                     : heteroComm->oneSideHandleCapacity * 2;
+    struct flagcxOneSideHandleInfo **newArr =
+        (struct flagcxOneSideHandleInfo **)realloc(
+            heteroComm->oneSideHandles,
+            newCap * sizeof(struct flagcxOneSideHandleInfo *));
+    if (newArr == NULL)
+      return flagcxSystemError;
+    for (int i = heteroComm->oneSideHandleCapacity; i < newCap; i++)
+      newArr[i] = NULL;
+    heteroComm->oneSideHandles = newArr;
+    heteroComm->oneSideHandleCapacity = newCap;
+  }
+
+  FLAGCXCHECKGOTO(flagcxCalloc(&info, 1), res, fail);
+  FLAGCXCHECKGOTO(flagcxOneSideBuildFullMesh(heteroComm, info), res, fail_info);
+
+  // Store at current slot (should be slot 0 if this is truly the first)
+  {
+    int slot = heteroComm->oneSideHandleCount;
+    heteroComm->oneSideHandles[slot] = info;
+    heteroComm->oneSideHandleCount = slot + 1;
+
+    // Publish sendComms to RMA proxy so its progress thread can use them
+    if (slot == 0 && info->fullSendComms != NULL) {
+      flagcxHeteroRmaProxyPublishSendComms(heteroComm, info->fullSendComms);
+    }
+  }
+
+  INFO(FLAGCX_REG,
+       "flagcxOneSideEnsureFullMesh: lazily built full-mesh connections "
+       "(slot %d)",
+       heteroComm->oneSideHandleCount - 1);
+  return flagcxSuccess;
+
+fail_info:
+  free(info);
+fail:
   return res;
 }
 
@@ -726,19 +894,18 @@ flagcxResult_t flagcxOneSideSignalRegister(const flagcxComm_t comm, void *buff,
   }
 
   // Signal registration reuses full-mesh connections from this heteroComm's
-  // first data handle.  Requires at least one data handle first.
-  struct flagcxOneSideHandleInfo *firstDataHandle = NULL;
-  if (heteroComm->oneSideHandleCount > 0 &&
-      heteroComm->oneSideHandles[0] != NULL &&
-      heteroComm->oneSideHandles[0]->fullRecvComms != NULL) {
-    firstDataHandle = heteroComm->oneSideHandles[0];
+  // first data handle.  Lazily build them if not yet established.
+  {
+    flagcxResult_t meshRes = flagcxOneSideEnsureFullMesh(heteroComm);
+    if (meshRes != flagcxSuccess) {
+      INFO(FLAGCX_REG,
+           "flagcxOneSideSignalRegister: failed to ensure full-mesh (%d)",
+           (int)meshRes);
+      return meshRes;
+    }
   }
-  if (firstDataHandle == NULL) {
-    INFO(FLAGCX_REG,
-         "flagcxOneSideSignalRegister: no full-mesh connections for "
-         "this heteroComm, register a data buffer first");
-    return flagcxNotSupported;
-  }
+  struct flagcxOneSideHandleInfo *firstDataHandle =
+      heteroComm->oneSideHandles[0];
 
   flagcxResult_t res = flagcxSuccess;
   void *mrHandle = NULL;
@@ -861,12 +1028,14 @@ fail_mr:
 }
 
 flagcxResult_t flagcxOneSideSignalDeregister(flagcxComm_t comm) {
-  if (comm == NULL || comm->heteroComm == NULL)
+  if (comm == NULL || comm->heteroComm == NULL) {
     return flagcxInternalError;
+  }
   struct flagcxHeteroComm *heteroComm = comm->heteroComm;
   struct flagcxOneSideHandleInfo *info = heteroComm->signalHandle;
-  if (info == NULL)
+  if (info == NULL) {
     return flagcxSuccess;
+  }
 
   if (heteroComm->netAdaptor != NULL) {
     if (info->localMrHandle != NULL && info->localRecvComm != NULL) {
@@ -926,19 +1095,18 @@ flagcxResult_t flagcxOneSideStagingRegister(const flagcxComm_t comm, void *buff,
   }
 
   // Staging registration reuses full-mesh connections from this heteroComm's
-  // first data handle.  Requires at least one data handle first.
-  struct flagcxOneSideHandleInfo *firstDataHandleStg = NULL;
-  if (heteroComm->oneSideHandleCount > 0 &&
-      heteroComm->oneSideHandles[0] != NULL &&
-      heteroComm->oneSideHandles[0]->fullRecvComms != NULL) {
-    firstDataHandleStg = heteroComm->oneSideHandles[0];
+  // first data handle.  Lazily build them if not yet established.
+  {
+    flagcxResult_t meshRes = flagcxOneSideEnsureFullMesh(heteroComm);
+    if (meshRes != flagcxSuccess) {
+      INFO(FLAGCX_REG,
+           "flagcxOneSideStagingRegister: failed to ensure full-mesh (%d)",
+           (int)meshRes);
+      return meshRes;
+    }
   }
-  if (firstDataHandleStg == NULL) {
-    INFO(FLAGCX_REG,
-         "flagcxOneSideStagingRegister: no full-mesh connections for "
-         "this heteroComm, register a data buffer first");
-    return flagcxNotSupported;
-  }
+  struct flagcxOneSideHandleInfo *firstDataHandleStg =
+      heteroComm->oneSideHandles[0];
 
   flagcxResult_t res = flagcxSuccess;
   void *mrHandle = NULL;
@@ -1178,16 +1346,59 @@ flagcxOneSideBarrierDeregister(const flagcxComm_t comm,
   return flagcxSuccess;
 }
 
+static flagcxResult_t
+flagcxValidateMemoryRange(void *buff, size_t size,
+                          flagcxMemAllocator_t allocator) {
+  if (allocator != flagcxMemCCL && allocator != flagcxMemSHMEM) {
+    WARN("Invalid allocator %d for buffer registration.", (int)allocator);
+    return flagcxInvalidArgument;
+  }
+
+  flagcxMemAllocationInfo info;
+  flagcxResult_t res = globalMemAllocRegistry.findRange(buff, 1, &info);
+  if (res == flagcxSuccess) {
+    if (globalMemAllocRegistry.findRange(buff, size, &info) != flagcxSuccess) {
+      WARN("Registration range exceeds its flagcxMemAlloc allocation.");
+      return flagcxInvalidUsage;
+    }
+    if (info.allocator != allocator) {
+      WARN("Registration allocator mismatch (requested %d, recorded %d).",
+           (int)allocator, (int)info.allocator);
+      return flagcxInvalidUsage;
+    }
+    if (allocator == flagcxMemSHMEM &&
+        info.backend != flagcxMemAllocBackendShmem) {
+      WARN("SHMEM registration requires a SHMEM-backed allocation.");
+      return flagcxInvalidUsage;
+    }
+    return flagcxSuccess;
+  }
+  if (res != flagcxInvalidUsage)
+    return res;
+
+  // CCL registration also accepts external user buffers. SHMEM Device API
+  // memory must come from flagcxMemAlloc so symmetric-heap provenance and
+  // exact bounds are known.
+  if (allocator == flagcxMemSHMEM) {
+    WARN("SHMEM registration requires flagcxMemAlloc(..., flagcxMemSHMEM).");
+    return flagcxInvalidUsage;
+  }
+  return flagcxSuccess;
+}
+
 flagcxResult_t flagcxCommRegister(const flagcxComm_t comm, void *buff,
-                                  size_t size, void **handle) {
+                                  size_t size, void **handle,
+                                  flagcxMemAllocator_t allocator) {
   if (comm != nullptr) {
     FLAGCXCHECK(flagcxEnsureCommReady(comm));
   }
 
-  if (buff == NULL || size == 0) {
-    WARN("Invalid buffer or size for buffer registration.");
+  if (buff == NULL || size == 0 || handle == nullptr) {
+    WARN("Invalid buffer, size, or handle for buffer registration.");
     return flagcxInvalidArgument;
   }
+  *handle = nullptr;
+  FLAGCXCHECK(flagcxValidateMemoryRange(buff, size, allocator));
 
   // Step 1: Register in globalRegPool (both paths)
   // Key: heteroComm if available (p2p/net downstream use it), else homoComm
@@ -1197,13 +1408,23 @@ flagcxResult_t flagcxCommRegister(const flagcxComm_t comm, void *buff,
     regKey =
         comm->heteroComm ? (void *)comm->heteroComm : (void *)comm->homoComm;
   }
-  globalRegPool.registerBuffer(regKey, buff, size);
+  FLAGCXCHECK(globalRegPool.registerBuffer(regKey, buff, size));
   flagcxRegItem *regItem = globalRegPool.getItem(regKey, buff);
+  if (regItem == nullptr) {
+    WARN("flagcxCommRegister: globalRegPool did not return a registration");
+    return flagcxInternalError;
+  }
 
   *handle = reinterpret_cast<void *>(regItem);
 
   // Null comm: pool-only registration, skip backend steps
   if (comm == nullptr) {
+    return flagcxSuccess;
+  }
+
+  // SHMEM path: buffer is in the SHMEM symmetric heap,
+  // no IPC handles or MR registration needed.
+  if (allocator == flagcxMemSHMEM) {
     return flagcxSuccess;
   }
 
@@ -1296,7 +1517,8 @@ fail:
   return res;
 }
 
-flagcxResult_t flagcxCommDeregister(const flagcxComm_t comm, void *handle) {
+flagcxResult_t flagcxCommDeregister(const flagcxComm_t comm, void *handle,
+                                    flagcxMemAllocator_t allocator) {
   if (comm != nullptr) {
     FLAGCXCHECK(flagcxEnsureCommReady(comm));
   }
@@ -1352,11 +1574,19 @@ flagcxResult_t flagcxCommDeregister(const flagcxComm_t comm, void *handle) {
 
 flagcxResult_t flagcxCommWindowRegister(flagcxComm_t comm, void *buff,
                                         size_t size, flagcxWindow_t *win,
-                                        int winFlags) {
-  if (win == nullptr || *win != nullptr) {
+                                        int winFlags,
+                                        flagcxMemAllocator_t allocator) {
+  if (buff == nullptr || size == 0 || win == nullptr || *win != nullptr) {
     return flagcxInvalidArgument;
   }
   FLAGCXCHECK(flagcxEnsureCommReady(comm));
+  FLAGCXCHECK(flagcxValidateMemoryRange(buff, size, allocator));
+  // SHMEM path: buffer is already in the SHMEM symmetric heap, so no
+  // additional communicator window registration is needed.
+  if (allocator == flagcxMemSHMEM) {
+    *win = nullptr;
+    return flagcxSuccess;
+  }
   if (useHomoComm(comm) && !useHeteroComm()) {
     FLAGCXCHECK(flagcxCalloc(win, 1));
     flagcxResult_t res =
@@ -1402,9 +1632,12 @@ flagcxResult_t flagcxCommWindowRegister(flagcxComm_t comm, void *buff,
   return flagcxSuccess;
 }
 
-flagcxResult_t flagcxCommWindowDeregister(flagcxComm_t comm,
-                                          flagcxWindow_t win) {
+flagcxResult_t flagcxCommWindowDeregister(flagcxComm_t comm, flagcxWindow_t win,
+                                          flagcxMemAllocator_t allocator) {
   if (win == nullptr) {
+    return flagcxSuccess;
+  }
+  if (allocator == flagcxMemSHMEM) {
     return flagcxSuccess;
   }
   FLAGCXCHECK(flagcxEnsureCommReady(comm));
@@ -1773,27 +2006,64 @@ static flagcxResult_t flagcxDevCommStateDestroy(flagcxComm_t comm) {
   return flagcxSuccess;
 }
 
-flagcxResult_t flagcxHomoCommInit(flagcxUniqueId_t commId,
-                                  flagcxUniqueId *uniqueIdData,
-                                  struct bootstrapState *state,
+static flagcxResult_t flagcxCollectUniqueIdResult(struct bootstrapState *state,
+                                                  int rank, int nranks,
+                                                  flagcxResult_t localResult) {
+  std::vector<flagcxResult_t> resultData(nranks, flagcxSuccess);
+  resultData[rank] = localResult;
+  FLAGCXCHECK(bootstrapCollAllGather(state, (void *)resultData.data(),
+                                     sizeof(flagcxResult_t)));
+  FLAGCXCHECK(bootstrapCollBarrier(state, rank, nranks, 0));
+
+  for (int peer = 0; peer < nranks; peer++) {
+    if (resultData[peer] != flagcxSuccess) {
+      return resultData[peer];
+    }
+  }
+  return flagcxSuccess;
+}
+
+static flagcxResult_t flagcxBuildHomoRankList(flagcxComm_t comm,
+                                              std::vector<int> &globalRanks) {
+  globalRanks.assign(comm->homoRanks, -1);
+  int clusterId = comm->clusterIds[comm->rank];
+  for (int globalRank = 0; globalRank < comm->nranks; globalRank++) {
+    if (comm->clusterIds[globalRank] != clusterId) {
+      continue;
+    }
+    int homoRank = comm->globalRank2HomoRank[globalRank];
+    if (homoRank < 0 || homoRank >= comm->homoRanks ||
+        globalRanks[homoRank] != -1) {
+      return flagcxInternalError;
+    }
+    globalRanks[homoRank] = globalRank;
+  }
+  for (int globalRank : globalRanks) {
+    if (globalRank == -1) {
+      return flagcxInternalError;
+    }
+  }
+  return flagcxSuccess;
+}
+
+flagcxResult_t flagcxHomoCommInit(struct bootstrapState *state,
                                   flagcxComm_t comm,
                                   flagcxInnerComm_t *homoComm /*out*/) {
   int rank = comm->rank;
   int nranks = comm->nranks;
-  memset((void *)commId, 0, sizeof(*commId));
-  memset((void *)uniqueIdData, 0, nranks * sizeof(flagcxUniqueId));
-  if (comm->homoRank == 0) {
-    cclAdaptors[flagcxCCLAdaptorDevice]->getUniqueId(&commId);
+  flagcxInnerUniqueId commIdStorage = {};
+  flagcxInnerUniqueId_t commId = &commIdStorage;
+  std::vector<int> homoGlobalRanks;
+  flagcxResult_t uniqueIdResult =
+      flagcxBuildHomoRankList(comm, homoGlobalRanks);
+  if (uniqueIdResult == flagcxSuccess && comm->homoRank == 0) {
+    uniqueIdResult = cclAdaptors[flagcxCCLAdaptorDevice]->getUniqueId(&commId);
   }
-  if (comm->homoRank == 0) {
-    memcpy((void *)&uniqueIdData[rank], (void *)commId, sizeof(flagcxUniqueId));
-  }
-  FLAGCXCHECK(bootstrapCollAllGather(state, (void *)uniqueIdData,
-                                     sizeof(flagcxUniqueId)));
-  FLAGCXCHECK(bootstrapCollBarrier(state, rank, nranks, 0));
+  FLAGCXCHECK(flagcxCollectUniqueIdResult(state, rank, nranks, uniqueIdResult));
 
-  memcpy((void *)commId, (void *)&uniqueIdData[comm->homoRootRank],
-         sizeof(flagcxUniqueId));
+  FLAGCXCHECK(bootstrapCollSubgroupBroadcast(state, homoGlobalRanks.data(),
+                                             comm->homoRank, comm->homoRanks, 0,
+                                             (void *)commId, sizeof(*commId)));
   FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorDevice]->commInitRank(
       homoComm, comm->homoRanks, commId, comm->homoRank, NULL));
   return flagcxSuccess;
@@ -2005,9 +2275,6 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
     (*comm)->hasSingleRankHomoComm = 0;
   }
 
-  flagcxUniqueId *uniqueIdData;
-  FLAGCXCHECK(flagcxCalloc(&uniqueIdData, nranks));
-
   // Tuner init
   bool useTuner = false;
   const char *useTunerEnv = flagcxGetEnv("FLAGCX_USE_TUNER");
@@ -2017,9 +2284,6 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
   INFO(FLAGCX_INIT, "Flagcx USE_TUNER flag set to %d", useTuner);
   if (useTuner) {
     (*comm)->tuner = &internalTuner;
-    FLAGCXCHECK(flagcxCalloc(&(*comm)->commId, 1));
-    memcpy((*comm)->commId, commId, sizeof(flagcxUniqueId));
-    (*comm)->uniqueIdData = uniqueIdData;
     (*comm)->tunerInnerComm = NULL;
     (*comm)->isTunningComm = false;
     (*comm)->isTuningWithFlagscale = false;
@@ -2068,8 +2332,7 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
              nConfigs);
 
         flagcxInnerComm_t innerComm = NULL;
-        FLAGCXCHECK(
-            flagcxHomoCommInit(commId, uniqueIdData, state, *comm, &innerComm));
+        FLAGCXCHECK(flagcxHomoCommInit(state, *comm, &innerComm));
         // Insert item into commMap
         (*comm)->commMap[tag] = innerComm;
         // For backward compatible, also assign homo_comm field.
@@ -2080,8 +2343,7 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
     if (isTuningWithFlagscale) {
       // Create a default communicator based on the default config
       flagcxInnerComm_t innerComm = NULL;
-      FLAGCXCHECK(
-          flagcxHomoCommInit(commId, uniqueIdData, state, *comm, &innerComm));
+      FLAGCXCHECK(flagcxHomoCommInit(state, *comm, &innerComm));
       // Insert item into homoCommMap
       (*comm)->tunerInnerComm = innerComm;
       // For backward compatible, also assign homoComm field.
@@ -2089,26 +2351,23 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
     }
   } else {
     (*comm)->tuner = NULL;
-    FLAGCXCHECK(flagcxHomoCommInit(commId, uniqueIdData, state, *comm,
-                                   &((*comm)->homoComm)));
+    FLAGCXCHECK(flagcxHomoCommInit(state, *comm, &((*comm)->homoComm)));
   }
 
   if (!useHomoComm(*comm) || useHeteroComm()) {
-    // Reset commId and hetero root rank calls flagcxHeteroGetUniqueId
-    memset((void *)commId, 0, sizeof(flagcxUniqueId));
-    memset((void *)uniqueIdData, 0, nranks * sizeof(flagcxUniqueId));
+    flagcxUniqueId heteroCommId = {};
+    flagcxResult_t uniqueIdResult = flagcxSuccess;
     if (rank == 0) {
-      flagcxHeteroGetUniqueId(commId);
-      memcpy((void *)&uniqueIdData[0], (void *)commId, sizeof(flagcxUniqueId));
+      uniqueIdResult = flagcxHeteroGetUniqueId(&heteroCommId);
     }
-    FLAGCXCHECK(bootstrapCollAllGather(state, (void *)uniqueIdData,
-                                       sizeof(flagcxUniqueId)));
-    FLAGCXCHECK(bootstrapCollBarrier(state, rank, nranks, 0));
-
-    memcpy((void *)commId, (void *)&uniqueIdData[0], sizeof(flagcxUniqueId));
-    // call flagcxHeteroCommInitRank
     FLAGCXCHECK(
-        flagcxHeteroCommInitRank(&(*comm)->heteroComm, nranks, *commId, rank));
+        flagcxCollectUniqueIdResult(state, rank, nranks, uniqueIdResult));
+    FLAGCXCHECK(bootstrapCollBroadcast(
+        state, rank, nranks, 0, (void *)&heteroCommId, sizeof(heteroCommId)));
+
+    // call flagcxHeteroCommInitRank
+    FLAGCXCHECK(flagcxHeteroCommInitRank(&(*comm)->heteroComm, nranks,
+                                         heteroCommId, rank));
 
     // Share ipcTable with heteroComm for intra-node D2D bypass
     (*comm)->heteroComm->ipcTable = (*comm)->ipcTable;
@@ -2120,8 +2379,9 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
         FLAGCXCHECK((*comm)->heteroComm->netAdaptor->getProperties(
             (*comm)->heteroComm->netDev, bootstrapGetNetProperties()));
       }
+      flagcxInnerUniqueId hostCommId = {};
       FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorHost]->commInitRank(
-          &(*comm)->hostComm, nranks, commId, rank, state));
+          &(*comm)->hostComm, nranks, &hostCommId, rank, state));
     }
   }
 
@@ -2184,27 +2444,26 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
          (*comm)->homoInterRanks, (*comm)->hasSingleRankHomoComm);
 
     // Experimental for multi-nic support
-    // Reset commId and homo inter root rank calls underlying GetUniqueId
-    // function for initialization of homo inter communicator
-    memset((void *)commId, 0, sizeof(flagcxUniqueId));
-    memset((void *)uniqueIdData, 0, nranks * sizeof(flagcxUniqueId));
+    flagcxInnerUniqueId homoInterCommIdStorage = {};
+    flagcxInnerUniqueId_t homoInterCommId = &homoInterCommIdStorage;
     // Let homoInterRootRank call underlying GetUniqueId function
     // for initialization of homo inter communicator
+    flagcxResult_t uniqueIdResult = flagcxSuccess;
     if (rank == (*comm)->homoInterRootRank) {
-      cclAdaptors[flagcxCCLAdaptorDevice]->getUniqueId(&commId);
-      memcpy((void *)&uniqueIdData[rank], (void *)commId,
-             sizeof(flagcxUniqueId));
+      uniqueIdResult =
+          cclAdaptors[flagcxCCLAdaptorDevice]->getUniqueId(&homoInterCommId);
     }
-    // Collect uniqueIdData globally
-    FLAGCXCHECK(bootstrapCollAllGather(state, (void *)uniqueIdData,
-                                       sizeof(flagcxUniqueId)));
-    FLAGCXCHECK(bootstrapCollBarrier(state, rank, nranks, 0));
+    FLAGCXCHECK(
+        flagcxCollectUniqueIdResult(state, rank, nranks, uniqueIdResult));
+
     // Call cclAdaptor->commInitRank
     if ((*comm)->homoInterRootRank != -1) {
-      memcpy((void *)commId, (void *)&uniqueIdData[(*comm)->homoInterRootRank],
-             sizeof(flagcxUniqueId));
+      FLAGCXCHECK(bootstrapCollSubgroupBroadcast(
+          state, myClusterInterRanks.data(), (*comm)->homoInterMyRank,
+          (*comm)->homoInterRanks, 0, (void *)homoInterCommId,
+          sizeof(*homoInterCommId)));
       FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorDevice]->commInitRank(
-          &(*comm)->homoInterComm, (*comm)->homoInterRanks, commId,
+          &(*comm)->homoInterComm, (*comm)->homoInterRanks, homoInterCommId,
           (*comm)->homoInterMyRank, NULL));
     }
     free(nicDistanceData);
@@ -2221,10 +2480,6 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
 
   free(clusterInterRankData);
   free(vendorData);
-  if (!useTuner) {
-    free(uniqueIdData);
-  }
-
   // Initialize custom op state (non-fatal if fails)
   FLAGCXCHECK(flagcxDevCommStateInit(*comm));
 
@@ -2270,12 +2525,11 @@ flagcxResult_t flagcxCommDestroy(flagcxComm_t comm) {
         cclAdaptors[flagcxCCLAdaptorDevice]->commDestroy(comm->homoComm));
   }
 
-  if (!useHomoComm(comm)) {
-    // Tear down inter-node signal relay first: drains FIFOs and closes RDMA
-    // connections. Must run before flagcxHeteroCommDestroy, which frees
-    // proxyState and heteroComm. Proxy threads are stopped inside
-    // flagcxCommRelayDestroy via the bootstrap barrier before any teardown.
-    FLAGCXCHECK(flagcxCommRelayDestroy(comm));
+  if (!useHomoComm(comm) || useHeteroComm()) {
+    // Backend-level comm cleanup: relay teardown, IPC table cleanup.
+    // Must run before flagcxHeteroCommDestroy, which frees proxyState and
+    // heteroComm.
+    FLAGCXCHECK(flagcxCommCleanup(comm));
     // Destroy hetero comm (stops/joins proxy threads, frees proxyState)
     flagcxOneSideStagingDeregister(comm);
     flagcxOneSideSignalDeregister(comm);
@@ -2309,9 +2563,6 @@ flagcxResult_t flagcxCommDestroy(flagcxComm_t comm) {
   // Destroy tuner
   if (comm->tuner) {
     comm->tuner->destroy(comm->tunerContext);
-    // Free uniqueIdData and commId
-    free(comm->uniqueIdData);
-    free(comm->commId);
   }
 
   // Finalize net adaptor plugin (dlclose)

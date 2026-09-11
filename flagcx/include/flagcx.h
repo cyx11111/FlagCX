@@ -172,6 +172,8 @@ struct flagcxDeviceHandle {
   flagcxResult_t (*eventRecord)(flagcxEvent_t event, flagcxStream_t stream);
   flagcxResult_t (*eventSynchronize)(flagcxEvent_t event);
   flagcxResult_t (*eventQuery)(flagcxEvent_t event);
+  flagcxResult_t (*eventElapsedTime)(float *ms, flagcxEvent_t start,
+                                     flagcxEvent_t end);
   // IpcMemHandle functions
   flagcxResult_t (*ipcMemHandleCreate)(flagcxIpcMemHandle_t *handle,
                                        size_t *size);
@@ -207,26 +209,75 @@ flagcxResult_t flagcxHandleInit(flagcxHandlerGroup_t *handler);
 /* Deprecated: use flagcxDeviceHandleFree instead */
 flagcxResult_t flagcxHandleFree(flagcxHandlerGroup_t handler);
 
-/* User buffer registration functions. The actual allocated size might
- * be larger than requested due to granularity requirement. */
-flagcxResult_t flagcxMemAlloc(void **ptr, size_t size);
-flagcxResult_t flagcxMemFree(void *ptr);
+/* Allocation and user-buffer registration. A backend may reserve more memory
+ * than requested to satisfy its granularity, but FlagCX tracks the requested
+ * size as the usable allocation boundary. */
+
+/* Memory allocator selection */
+typedef enum {
+  flagcxMemCCL =
+      0, /* CCL-managed in homogeneous mode; native platform allocation in
+            heterogeneous mode. External CCL user buffers may also be
+            registered without first calling flagcxMemAlloc. */
+  flagcxMemSHMEM =
+      1, /* SHMEM symmetric heap (NVSHMEM or XSHMEM). Buffers used
+            by FlagCX Device API or SHMEM registration must be
+            allocated by flagcxMemAlloc with this allocator. The
+            selected SHMEM runtime must already be initialized;
+            Device API users normally keep a flagcxDevComm alive. */
+} flagcxMemAllocator_t;
+
+/* flagcxMemFree requires the original base pointer and the same allocator that
+ * were passed to flagcxMemAlloc. Pointers obtained directly from a native
+ * allocator remain owned by that allocator and cannot be released through
+ * flagcxMemFree. */
+
+#ifdef __cplusplus
+flagcxResult_t flagcxMemAlloc(void **ptr, size_t size,
+                              flagcxMemAllocator_t allocator = flagcxMemCCL);
+flagcxResult_t flagcxMemFree(void *ptr,
+                             flagcxMemAllocator_t allocator = flagcxMemCCL);
 
 /* Register/Deregister user buffer for zero-copy operation */
+flagcxResult_t
+flagcxCommRegister(const flagcxComm_t comm, void *buff, size_t size,
+                   void **handle,
+                   flagcxMemAllocator_t allocator = flagcxMemCCL);
+flagcxResult_t
+flagcxCommDeregister(const flagcxComm_t comm, void *handle,
+                     flagcxMemAllocator_t allocator = flagcxMemCCL);
+#else
+flagcxResult_t flagcxMemAlloc(void **ptr, size_t size,
+                              flagcxMemAllocator_t allocator);
+flagcxResult_t flagcxMemFree(void *ptr, flagcxMemAllocator_t allocator);
 flagcxResult_t flagcxCommRegister(const flagcxComm_t comm, void *buff,
-                                  size_t size, void **handle);
-flagcxResult_t flagcxCommDeregister(const flagcxComm_t comm, void *handle);
+                                  size_t size, void **handle,
+                                  flagcxMemAllocator_t allocator);
+flagcxResult_t flagcxCommDeregister(const flagcxComm_t comm, void *handle,
+                                    flagcxMemAllocator_t allocator);
+#endif
 
 /* Window registration flags */
 #define FLAGCX_WIN_DEFAULT 0x00
 #define FLAGCX_WIN_COLL_SYMMETRIC 0x01
 
 /* Register/Deregister user buffer for symmetric operation */
+#ifdef __cplusplus
+flagcxResult_t
+flagcxCommWindowRegister(flagcxComm_t comm, void *buff, size_t size,
+                         flagcxWindow_t *win, int winFlags,
+                         flagcxMemAllocator_t allocator = flagcxMemCCL);
+flagcxResult_t
+flagcxCommWindowDeregister(flagcxComm_t comm, flagcxWindow_t win,
+                           flagcxMemAllocator_t allocator = flagcxMemCCL);
+#else
 flagcxResult_t flagcxCommWindowRegister(flagcxComm_t comm, void *buff,
                                         size_t size, flagcxWindow_t *win,
-                                        int winFlags);
-flagcxResult_t flagcxCommWindowDeregister(flagcxComm_t comm,
-                                          flagcxWindow_t win);
+                                        int winFlags,
+                                        flagcxMemAllocator_t allocator);
+flagcxResult_t flagcxCommWindowDeregister(flagcxComm_t comm, flagcxWindow_t win,
+                                          flagcxMemAllocator_t allocator);
+#endif
 
 /* Register a buffer for one-sided RDMA operations (Get/Put/PutValue).
  * Creates MR handles for RDMA-capable net adaptors.
@@ -490,6 +541,9 @@ flagcxResult_t flagcxRecv(void *recvbuff, size_t count,
  * memory.  Collective: ALL ranks in the communicator must call. */
 flagcxResult_t flagcxOneSideSignalRegister(const flagcxComm_t comm, void *buff,
                                            size_t size, int ptrType);
+
+/* Release signal buffer MR resources. */
+flagcxResult_t flagcxOneSideSignalDeregister(const flagcxComm_t comm);
 
 /* Register a host-pinned staging buffer for one-sided PutValue operations.
  * Must be called after flagcxOneSideSignalRegister.  Collective: ALL ranks

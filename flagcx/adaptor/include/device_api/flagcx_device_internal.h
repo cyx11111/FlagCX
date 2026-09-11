@@ -15,12 +15,14 @@
 #define FLAGCX_DEVICE_API_INTERNAL_H_
 
 #include "flagcx_kernel.h"
+#include "mem_alloc_provenance.h"
 #include "shmutils.h"
 #include <pthread.h>
 
 // Forward declaration for typed vendor device comm handle
 struct flagcxInnerDevComm;
 typedef struct flagcxInnerDevComm *flagcxInnerDevComm_t;
+struct flagcxOneSideHandleInfo;
 
 // ============================================================
 // Section 1: flagcxDevCommInternal — Host-Side Opaque Handle
@@ -50,32 +52,31 @@ struct flagcxDevCommInternal {
                           // epochs]
   int nBarriers;          // = FLAGCX_DEVICE_CTA_COUNT (needed in kernel)
   // Host-side cleanup bookkeeping (not passed to kernel)
+  bool localBarrierFlagsDeviceAllocated; // true only when localBarrierFlags is
+                                         // owned device memory, not an SHM
+                                         // device-visible alias
   int barrierIpcIndex;  // index into comm->ipcTable (-1 if no IPC barrier)
   int *localRankToRank; // intra-node rank mapping (for IPC exchange)
   int nLocalRanks;
   // flagcxShm barrier path (non-null when FLAGCX_SIGNAL_HOST_ENABLE=1)
-  void *localBarrierShmPtr;  // CPU VA of own shm mapping (hostUnregister +
-                             // flagcxShmClose)
+  void *localBarrierShmPtr;  // non-owning alias of this rank's entry in
+                             // peerBarrierShmPtrs
   void **peerBarrierShmPtrs; // CPU VA array [nLocalRanks] for each peer's shm
-                             // mapping (hostUnregister + flagcxShmClose)
-  size_t barrierShmSize;     // size in bytes (for hostUnregister)
+                             // mapping; owns each successful host registration
+  int registeredBarrierShmCount;     // registered prefix of peerBarrierShmPtrs
+  size_t barrierShmSize;             // size in bytes (for hostUnregister)
   uint64_t **barrierDevPeerPtrsRaw;  // standalone device array (deviceFree; shm
                                      // path only)
   flagcxShmHandle_t myShmHandle;     // own shm handle (flagcxShmClose)
   flagcxShmHandle_t *peerShmHandles; // peer shm handles [nLocalRanks]
 
-  // ---- Inter-node signal relay (set if nInterPeers > 0, else nullptr) ----
-  uint64_t *interSignalFlags;     // device pointer (from hostGetDevicePointer)
-  uint64_t *interSignalFlagsHost; // host pointer (for recv thread + dealloc)
+  // ---- Inter-node signal relay (set if nInterPeers > 0) ----
   int nInterPeers;     // number of inter-node peers (set on ALL ranks)
-  bool isInterLeader;  // true only on localRank 0 (manages connections)
   int *interPeerRanks; // global ranks of inter-node peers
-  // netAdaptor connections for signal relay (one-sided RDMA atomic)
-  void **signalSendComms;  // [nInterPeers] sendComm (for iputSignal)
-  void **barrierRecvComms; // [nInterPeers] recvComm (kept alive for QP)
-  void *barrierHandleInfo; // flagcxOneSideHandleInfo* with rkeys/baseVas
-  // netAdaptor pointer (cached for proxy)
-  void *netAdaptorPtr;
+  // NCCL GIN-style barrier fields (all ranks)
+  int teamRank;          // this rank's position in the inter-node team
+  int nTeamRanks;        // total number of nodes (team size for barrier)
+  int barrierSignalBase; // first signal slot index used for barriers
 
   // ---- One-sided Default layer (set if interSignalCount/interCounterCount >
   // 0)
@@ -88,11 +89,29 @@ struct flagcxDevCommInternal {
   int signalCount;
   int counterCount;
   int contextCount; // = reqs.interContextCount (default 4)
-  // Host-only: MR handles + staging for cleanup
-  void *signalBufferMr;        // MR handle for signalBuffer
-  void *counterBufferMr;       // MR handle for counterBuffer
+  // Symmetric scratch requested through reqs.intraScratchBytes is not mirrored
+  // here. The only backend that needs one (XSHMEM) allocates it from its
+  // symmetric heap, owns it in flagcxShmemCommInternal, and reaches the device
+  // through the trait Comm that record is layout-identical to. A copy in this
+  // struct had no reader and would invite the generic teardown path to free
+  // symmetric-heap memory with the wrong allocator.
+  // Host-only: communicator registrations installed for these buffers.
+  // Non-null only when this DevComm created the registration and therefore
+  // must deregister it before freeing the backing allocation.
+  struct flagcxOneSideHandleInfo *ownedSignalRegistration;
   void *putValueStagingBuffer; // 8 bytes host-pinned, MR registered
-  void *putValueStagingMr;     // MR handle for staging buffer
+  struct flagcxOneSideHandleInfo *ownedStagingRegistration;
+
+  // One-sided transport readiness.  Signal send/wait must use the same
+  // communicator-wide path because waits do not identify a sender.
+  int netOneSidedReady;
+  int netSignalReady;
+  int netPutValueReady;
+  int useP2pSignals;
+
+  // ---- P2P signal IPC pointers (intra-node direct atomic path) ----
+  uint64_t **signalPeerPtrs; // Device array: [localRanks] → peer signal bufs
+  int signalIpcSlot; // IPC table slot for signal peer pointers (-1 if not used)
 
   // ---- Vendor device comm (set if adaptor->devCommCreate succeeds, else NULL)
   // ----
@@ -101,6 +120,7 @@ struct flagcxDevCommInternal {
   // ---- Device pointer cache (for Triton integration) ----
   void *cachedDevicePtr;      // Lazily allocated by flagcxDevCommGetDevicePtr
   void *cachedNetContextsPtr; // Device memory for pre-allocated flagcxDevNet[]
+  void *cachedGridBarrierPtr; // Device memory for grid sync state (2 x uint32)
   pthread_mutex_t cachedPtrMutex; // Protects lazy init of cachedDevicePtr and
                                   // cachedNetContextsPtr
 };
@@ -119,7 +139,14 @@ struct flagcxDevCommInternal {
 // ============================================================
 struct flagcxDevMemInternal {
   // ---- Baseline (always set) ----
-  void *rawPtr;   // = buff parameter
+  void *rawPtr; // = buff parameter
+  // Exact allocation provenance when rawPtr belongs to a flagcxMemAlloc
+  // allocation. External CCL user buffers remain valid and untracked.
+  bool allocationTracked;
+  void *allocationBase;
+  size_t allocationSize;
+  flagcxMemAllocator_t allocator;
+  flagcxMemAllocBackend_t allocBackend;
   bool hasWindow; // true if any window layer is available (basic or symmetric)
   bool isSymmetric; // true only for FLAGCX_WIN_COLL_SYMMETRIC (enables
                     // one-sided)

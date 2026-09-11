@@ -8,7 +8,7 @@
  *   - Atomic: GCC built-in atomics (__atomic_*)
  *   - Coop*:  single-thread no-op implementations
  *
- * Used by CommTraits<Default<DefaultPlatform>> when neither
+ * Used by CommTraits<DefaultBackend<DefaultPlatform>> when neither
  * USE_NVIDIA_ADAPTOR nor USE_DU_ADAPTOR is defined.
  ************************************************************************/
 
@@ -55,6 +55,13 @@ struct PlatformTraits<DefaultPlatform> {
     }
     static inline void threadfenceSystem() {
       assert(false && "threadfenceSystem() on DefaultPlatform");
+    }
+    static inline void threadfenceDevice() {
+      assert(false && "threadfenceDevice() on DefaultPlatform");
+    }
+    template <typename DstPtr, typename SrcPtr>
+    static inline void coopCopyBytes(DstPtr, SrcPtr, size_t, int, int) {
+      assert(false && "coopCopyBytes() on DefaultPlatform");
     }
   };
 

@@ -22,6 +22,11 @@
 #include <cstring>
 #include <iostream>
 
+#if defined(FLAGCX_TEST_ALLOCATOR_SHMEM) && defined(USE_NVIDIA_ADAPTOR)
+extern "C" void flagcxNvshmemSyncDeviceState();
+extern "C" void flagcxNvshmemFinalizeDeviceState();
+#endif
+
 #define DATATYPE flagcxFloat
 
 int main(int argc, char *argv[]) {
@@ -50,6 +55,16 @@ int main(int argc, char *argv[]) {
   initMpiEnv(argc, argv, worldRank, worldSize, proc, totalProcs, color,
              splitComm, splitMask);
 
+#ifdef FLAGCX_TEST_ALLOCATOR_SHMEM
+  if (localRegister == 0) {
+    if (proc == 0)
+      printf("SHMEM Device API memory requires -R 1 or -R 2. Skipping.\n");
+    FLAGCXCHECK(flagcxDeviceHandleFree(devHandle));
+    MPI_Finalize();
+    return 0;
+  }
+#endif
+
   int nGpu;
   FLAGCXCHECK(devHandle->getDeviceCount(&nGpu));
   FLAGCXCHECK(devHandle->setDevice(worldRank % nGpu));
@@ -61,10 +76,39 @@ int main(int argc, char *argv[]) {
 
   FLAGCXCHECK(flagcxCommInitRank(&comm, totalProcs, &uniqueId, proc));
 
+#ifdef FLAGCX_TEST_ALLOCATOR_SHMEM
+  if (localRegister == 0) {
+    if (proc == 0)
+      printf("SHMEM peer-pointer AllReduce requires -R 1 or -R 2. "
+             "Skipping.\n");
+    FLAGCXCHECK(flagcxCommDestroy(comm));
+    FLAGCXCHECK(flagcxDeviceHandleFree(devHandle));
+    MPI_Finalize();
+    return 0;
+  }
+#endif
+
+#if defined(FLAGCX_TEST_ALLOCATOR_SHMEM) && defined(USE_NVIDIA_ADAPTOR)
+  // Sync NVSHMEM device state into this binary's __constant__ symbol.
+  // Must happen after flagcxCommInitRank (which calls nvshmem_init internally).
+  flagcxNvshmemSyncDeviceState();
+#endif
+
   // Create device communicator for custom kernel usage
   flagcxDevComm_t devComm = nullptr;
   flagcxDevCommRequirements reqs = FLAGCX_DEV_COMM_REQUIREMENTS_INITIALIZER;
   reqs.intraBarrierCount = FLAGCX_DEVICE_CTA_COUNT;
+#ifdef FLAGCX_TEST_ALLOCATOR_SHMEM
+  // Push-based backends (XSHMEM on P800 cannot read peer memory) stage each
+  // PEER's contribution in symmetric scratch: scratch[nRanks-1][maxBytes]. A
+  // rank never writes its own slot — its local addend is read straight from its
+  // own buffer at reduce time — so 4 ranks only need 3 slots. One net context
+  // per cluster keeps their signals in separate slots.
+  reqs.interContextCount = 12;
+  reqs.interSignalCount = 1;
+  reqs.intraScratchBytes =
+      (size_t)(totalProcs > 1 ? totalProcs - 1 : 1) * maxBytes;
+#endif
   FLAGCXCHECK(flagcxDevCommCreate(comm, &reqs, &devComm));
 
   flagcxStream_t stream;
@@ -87,20 +131,27 @@ int main(int argc, char *argv[]) {
   flagcxDevMem_t devMem = nullptr;
   // -R 0 uses cudaMalloc (IPC-compatible).
   // -R 1/-R 2 use flagcxMemAlloc with comm.
+#ifdef FLAGCX_TEST_ALLOCATOR_SHMEM
+  flagcxMemAllocator_t memAllocator = flagcxMemSHMEM;
+#else
+  flagcxMemAllocator_t memAllocator = flagcxMemCCL;
+#endif
   if (localRegister == 0) {
     FLAGCXCHECK(
         devHandle->deviceMalloc(&regBuff, maxBytes, flagcxMemDevice, NULL));
   } else {
-    FLAGCXCHECK(flagcxMemAlloc(&regBuff, maxBytes));
+    FLAGCXCHECK(flagcxMemAlloc(&regBuff, maxBytes, memAllocator));
   }
   if (localRegister == 2) {
     // Window mode: either go on Vendor path or Default path
     FLAGCXCHECK(flagcxCommWindowRegister(comm, regBuff, maxBytes, &win,
-                                         FLAGCX_WIN_COLL_SYMMETRIC));
+                                         FLAGCX_WIN_COLL_SYMMETRIC,
+                                         memAllocator));
     FLAGCXCHECK(flagcxDevMemCreate(comm, regBuff, maxBytes, win, &devMem));
   } else if (localRegister == 1) {
     // IPC mode: explicit NIC registration + implicit IPC peer exchange
-    FLAGCXCHECK(flagcxCommRegister(comm, regBuff, maxBytes, &regHandle));
+    FLAGCXCHECK(
+        flagcxCommRegister(comm, regBuff, maxBytes, &regHandle, memAllocator));
     FLAGCXCHECK(flagcxDevMemCreate(comm, regBuff, maxBytes, nullptr, &devMem));
   } else {
     // Raw mode: no explicit registration, implicit IPC via flagcxDevMemCreate
@@ -128,7 +179,7 @@ int main(int argc, char *argv[]) {
                                           count * sizeof(float),
                                           flagcxMemcpyDeviceToDevice, stream));
       FLAGCXCHECK(
-          flagcxIntraAllReduce(devMem, count, DATATYPE, devComm, stream));
+          launchKernelIntraAllReduce(devMem, count, DATATYPE, devComm, stream));
       FLAGCXCHECK(devHandle->deviceMemcpy(recvbuff, regBuff,
                                           count * sizeof(float),
                                           flagcxMemcpyDeviceToDevice, stream));
@@ -158,7 +209,7 @@ int main(int argc, char *argv[]) {
       FLAGCXCHECK(devHandle->deviceMemcpy(regBuff, sendbuff, bytes,
                                           flagcxMemcpyDeviceToDevice, stream));
       FLAGCXCHECK(
-          flagcxIntraAllReduce(devMem, count, DATATYPE, devComm, stream));
+          launchKernelIntraAllReduce(devMem, count, DATATYPE, devComm, stream));
       FLAGCXCHECK(devHandle->deviceMemcpy(recvbuff, regBuff, bytes,
                                           flagcxMemcpyDeviceToDevice, stream));
     }
@@ -208,19 +259,23 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  // Cleanup
+  // Cleanup — free SHMEM buffers before DevCommDestroy (which calls
+  // nvshmem_finalize), otherwise nvshmem_free hits a finalized library.
   FLAGCXCHECK(flagcxDevMemDestroy(comm, devMem));
-  FLAGCXCHECK(flagcxDevCommDestroy(comm, devComm));
   if (localRegister == 2) {
-    FLAGCXCHECK(flagcxCommWindowDeregister(comm, win));
+    FLAGCXCHECK(flagcxCommWindowDeregister(comm, win, memAllocator));
   } else if (localRegister == 1) {
-    FLAGCXCHECK(flagcxCommDeregister(comm, regHandle));
+    FLAGCXCHECK(flagcxCommDeregister(comm, regHandle, memAllocator));
   }
   if (localRegister == 0) {
     FLAGCXCHECK(devHandle->deviceFree(regBuff, flagcxMemDevice, NULL));
   } else {
-    FLAGCXCHECK(flagcxMemFree(regBuff));
+    FLAGCXCHECK(flagcxMemFree(regBuff, memAllocator));
   }
+  FLAGCXCHECK(flagcxDevCommDestroy(comm, devComm));
+#if defined(FLAGCX_TEST_ALLOCATOR_SHMEM) && defined(USE_NVIDIA_ADAPTOR)
+  flagcxNvshmemFinalizeDeviceState();
+#endif
   FLAGCXCHECK(devHandle->streamDestroy(stream));
   FLAGCXCHECK(flagcxCommDestroy(comm));
   FLAGCXCHECK(devHandle->deviceFree(sendbuff, flagcxMemDevice, NULL));

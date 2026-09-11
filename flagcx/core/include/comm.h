@@ -11,6 +11,7 @@
 #include "device.h"
 #include "flagcx_kernel.h"
 #include "flagcx_net.h"
+#include "flagcx_net_adaptor.h"
 #include "flagcx_tuner.h"
 #include "info.h"
 #include "register.h"
@@ -366,15 +367,8 @@ struct flagcxHeteroComm {
   flagcxDevComm_t devCommHandle;
   // Inter-node signal relay — established once, shared across devComms.
   bool relayInitialized;
-  bool isInterLeader;
   int nInterPeers;
   int *interPeerRanks;
-  uint64_t *interSignalFlags;
-  uint64_t *interSignalFlagsHost;
-  void **signalSendComms;
-  void **barrierRecvComms;
-  void *barrierHandleInfo;
-  void *netAdaptorPtr;
   // Async RMA proxy state (one-sided Put/Get offload thread).
   struct flagcxRmaProxyState *rmaProxy;
 
