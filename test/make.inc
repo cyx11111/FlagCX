@@ -72,7 +72,7 @@ PERF_INCLUDE := -I$(PROJECT_ROOT)/test/include
 # Vendor flags (pass through from environment)
 USE_NVIDIA         ?= 0
 USE_ASCEND         ?= 0
-USE_ILUVATAR_COREX ?= 0
+USE_ILUVATAR ?= 0
 USE_CAMBRICON      ?= 0
 USE_METAX          ?= 0
 USE_MUSA           ?= 0
@@ -90,6 +90,8 @@ SHMEM_HOME ?= /usr/local/nvshmem
 
 ifeq ($(USE_NVIDIA), 1)
   include $(PROJECT_ROOT)/makefiles/nvidia.mk
+else ifeq ($(USE_ILUVATAR), 1)
+  include $(PROJECT_ROOT)/makefiles/iluvatar.mk
 else ifeq ($(USE_KUNLUNXIN), 1)
   include $(PROJECT_ROOT)/makefiles/kunlunxin.mk
 else ifeq ($(USE_DU), 1)

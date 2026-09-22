@@ -36,6 +36,71 @@ static_assert(offsetof(flagcxDevCommRequirements, intraScratchBytes) == 40,
 
 namespace {
 
+struct CompletionDefaultsOnly {};
+struct Completion32Defaults {
+  static constexpr int completionBits = 32;
+  static constexpr int defaultCounterBits = 32;
+};
+
+struct CompletionTestAtomic {
+  template <typename T>
+  static T load(T *ptr, flagcxDeviceMemoryOrder_t) {
+    return *ptr;
+  }
+};
+
+static_assert(flagcxBackendCompletionBits<CompletionDefaultsOnly>::value == 64,
+              "vendor signal default changed");
+static_assert(flagcxBackendDefaultCounterBits<CompletionDefaultsOnly>::value ==
+                  56,
+              "vendor counter default changed");
+static_assert(flagcxBackendCompletionBits<Completion32Defaults>::value == 32,
+              "32-bit completion default not selected");
+static_assert(flagcxBackendDefaultCounterBits<Completion32Defaults>::value ==
+                  32,
+              "32-bit counter default not selected");
+
+TEST(CompletionDomainTest, ThirtyTwoBitArithmeticWrapsExplicitly) {
+  using Storage = DefaultCompletionStorage<uint32_t>;
+
+  Storage::validateBits(32);
+  EXPECT_EQ(Storage::completionValue(UINT32_MAX), UINT32_MAX);
+  EXPECT_EQ(Storage::advance(UINT32_MAX, 1), 0u);
+  EXPECT_EQ(Storage::advance(UINT32_MAX - 1, 1), UINT32_MAX);
+}
+
+TEST(CompletionDomainTest, ThirtyTwoBitDomainRejectsSixtyFourBitRequests) {
+  using Storage = DefaultCompletionStorage<uint32_t>;
+
+  EXPECT_DEATH_IF_SUPPORTED(Storage::validateBits(64), "");
+}
+
+TEST(CompletionDomainTest, ThirtyTwoBitDirectAndProxySumInDomain) {
+  using Storage = DefaultCompletionStorage<uint32_t>;
+  uint32_t direct[] = {UINT32_C(0x80000000)};
+  uint64_t proxy[] = {UINT64_C(0x80000000)};
+
+  EXPECT_EQ(Storage::loadCompletion<CompletionTestAtomic>(
+                direct, proxy, 0, flagcxDeviceMemoryOrderAcquire),
+            0u);
+}
+
+TEST(CompletionDomainTest, ThirtyTwoBitWaitComparisonHandlesWrap) {
+  using Storage = DefaultCompletionStorage<uint32_t>;
+
+  EXPECT_TRUE(Storage::waitBefore(UINT32_MAX, 0u));
+  EXPECT_FALSE(Storage::waitBefore(0u, UINT32_MAX));
+  EXPECT_FALSE(Storage::waitBefore(7u, 7u));
+}
+
+TEST(CompletionDomainTest, SixtyFourBitComparisonKeepsNumericOrdering) {
+  using Storage = DefaultCompletionStorage<uint64_t>;
+
+  EXPECT_TRUE(Storage::waitBefore(7u, 8u));
+  EXPECT_FALSE(Storage::waitBefore(8u, 7u));
+  EXPECT_EQ(Storage::advance(UINT32_MAX, 1), UINT64_C(0x100000000));
+}
+
 struct LegacyWindowTeam {};
 
 struct LegacyWindow {
@@ -173,27 +238,30 @@ flagcxOneSideHandleInfo *makeRegistration(void *buffer, void *mrHandle) {
     return nullptr;
   registration->baseVas =
       static_cast<uintptr_t *>(calloc(1, sizeof(uintptr_t)));
-  registration->rkeys = static_cast<uint32_t *>(calloc(1, sizeof(uint32_t)));
-  registration->lkeys = static_cast<uint32_t *>(calloc(1, sizeof(uint32_t)));
-  if (!registration->baseVas || !registration->rkeys || !registration->lkeys) {
-    free(registration->lkeys);
-    free(registration->rkeys);
+  registration->regionSizes = static_cast<size_t *>(calloc(1, sizeof(size_t)));
+  registration->mrInfos =
+      static_cast<flagcxNetMrInfo *>(calloc(1, sizeof(flagcxNetMrInfo)));
+  if (!registration->baseVas || !registration->regionSizes ||
+      !registration->mrInfos) {
+    free(registration->mrInfos);
+    free(registration->regionSizes);
     free(registration->baseVas);
     free(registration);
     return nullptr;
   }
   registration->baseVas[0] = reinterpret_cast<uintptr_t>(buffer);
+  registration->regionSizes[0] = 1;
+  registration->nRanks = 1;
   registration->localMrHandle = mrHandle;
   registration->localRecvComm = reinterpret_cast<void *>(0x9000);
-  registration->signalIpcSlot = -1;
   return registration;
 }
 
 void freeRegistration(flagcxOneSideHandleInfo *registration) {
   if (!registration)
     return;
-  free(registration->lkeys);
-  free(registration->rkeys);
+  free(registration->mrInfos);
+  free(registration->regionSizes);
   free(registration->baseVas);
   free(registration);
 }
@@ -432,19 +500,25 @@ TEST_F(DefaultDevCommCleanupTest,
   heteroComm.stagingHandle = makeRegistration(stagingBuffer, stagingMr);
   ASSERT_NE(heteroComm.signalHandle, nullptr);
   ASSERT_NE(heteroComm.stagingHandle, nullptr);
+  heteroComm.rmaSignalBase = signalBuffer;
+  heteroComm.rmaSignalSize = 1;
+  heteroComm.rmaSignalIpcSlot = -1;
 
   flagcxDevCommInternal devComm = {};
   devComm.barrierIpcIndex = -1;
   devComm.signalIpcSlot = -1;
   devComm.signalBuffer = static_cast<uint64_t *>(signalBuffer);
   devComm.putValueStagingBuffer = stagingBuffer;
+  devComm.ownedSignalBuffer = signalBuffer;
   devComm.ownedSignalRegistration = heteroComm.signalHandle;
   devComm.ownedStagingRegistration = heteroComm.stagingHandle;
 
   ASSERT_EQ(devApiBackend->devCommDestroy(&comm, &devComm), flagcxSuccess);
 
   EXPECT_EQ(heteroComm.signalHandle, nullptr);
+  EXPECT_EQ(heteroComm.rmaSignalBase, nullptr);
   EXPECT_EQ(heteroComm.stagingHandle, nullptr);
+  EXPECT_EQ(devComm.ownedSignalBuffer, nullptr);
   EXPECT_EQ(devComm.ownedSignalRegistration, nullptr);
   EXPECT_EQ(devComm.ownedStagingRegistration, nullptr);
   ASSERT_EQ(cleanupEvents.size(), 4u);

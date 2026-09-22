@@ -17,9 +17,14 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/impl/CUDAGuardImpl.h>
 #include <cuda_runtime.h>
+#elif USE_PPU_ADAPTOR
+#include <c10/core/impl/InlineStreamGuard.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/impl/CUDAGuardImpl.h>
+#include <cuda_runtime.h>
 #elif USE_ASCEND_ADAPTOR
 #include "torch_npu/csrc/core/npu/NPUStream.h"
-#elif USE_ILUVATAR_COREX_ADAPTOR
+#elif USE_ILUVATAR_ADAPTOR
 #include <c10/core/impl/InlineStreamGuard.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/impl/CUDAGuardImpl.h>
@@ -102,7 +107,10 @@ public:
 #elif USE_NVIDIA_ADAPTOR
         guard_(
             at::cuda::getStreamFromExternal(*(cudaStream_t *)stream, deviceId))
-#elif USE_ILUVATAR_COREX_ADAPTOR
+#elif USE_PPU_ADAPTOR
+        guard_(
+            at::cuda::getStreamFromExternal(*(cudaStream_t *)stream, deviceId))
+#elif USE_ILUVATAR_ADAPTOR
         guard_(
             at::cuda::getStreamFromExternal(*(cudaStream_t *)stream, deviceId))
 #elif USE_CAMBRICON_ADAPTOR
@@ -178,7 +186,10 @@ public:
 #elif USE_NVIDIA_ADAPTOR
     guard_.reset_stream(
         at::cuda::getStreamFromExternal(*(cudaStream_t *)stream, deviceId_));
-#elif USE_ILUVATAR_COREX_ADAPTOR
+#elif USE_PPU_ADAPTOR
+    guard_.reset_stream(
+        at::cuda::getStreamFromExternal(*(cudaStream_t *)stream, deviceId_));
+#elif USE_ILUVATAR_ADAPTOR
     guard_.reset_stream(
         at::cuda::getStreamFromExternal(*(cudaStream_t *)stream, deviceId_));
 #elif USE_CAMBRICON_ADAPTOR
@@ -228,7 +239,9 @@ private:
   int previousDevice_;
 #elif USE_NVIDIA_ADAPTOR
   c10::cuda::CUDAStreamGuard guard_;
-#elif USE_ILUVATAR_COREX_ADAPTOR
+#elif USE_PPU_ADAPTOR
+  c10::cuda::CUDAStreamGuard guard_;
+#elif USE_ILUVATAR_ADAPTOR
   c10::cuda::CUDAStreamGuard guard_;
 #elif USE_CAMBRICON_ADAPTOR
   torch_mlu::mlu::MLUStreamGuard guard_;

@@ -854,10 +854,10 @@ static flagcxResult_t flagcxUcxAddEp(flagcxUcxWorker_t *ucxWorker,
 }
 
 flagcxResult_t flagcxUcxInit() {
+  if (flagcxParamIbDisable() || flagcxParamUCXDisable())
+    return flagcxInternalError;
   if (flagcxUcxRefCount++)
     return flagcxSuccess;
-  if (flagcxParamUCXDisable())
-    return flagcxInternalError;
 
   for (int i = 0;
        i < sizeof(flagcxUcxWorkerTags) / sizeof(*flagcxUcxWorkerTags); i++) {
@@ -1513,7 +1513,13 @@ struct flagcxNetAdaptor flagcxNetUcx = {
     NULL, // iputSignal - not supported on UCX
 
     // Device name lookup
-    flagcxUcxGetDevFromName // getDevFromName
+    flagcxUcxGetDevFromName, // getDevFromName
+
+    // Optional one-sided batch helpers and MR metadata
+    NULL, // iputBatch
+    NULL, // testBatch
+    NULL, // igetBatch
+    NULL, // getMrInfo
 };
 
 #endif // USE_UCX

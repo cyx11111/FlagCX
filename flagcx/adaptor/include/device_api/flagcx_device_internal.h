@@ -86,6 +86,11 @@ struct flagcxDevCommInternal {
       *shadowBuffer; // GPU memory (local only, no MR), [signalCount] entries
   uint64_t
       *counterBuffer; // GPU memory (flagcxMemAlloc), [counterCount] entries
+  // Device-RMW completion plane.  It aliases the buffers above on platforms
+  // with 64-bit RMW and owns separate uint32_t buffers on 32-bit-RMW
+  // platforms.  Kept opaque here so this host descriptor has one layout.
+  void *completionSignalBuffer;
+  void *completionCounterBuffer;
   int signalCount;
   int counterCount;
   int contextCount; // = reqs.interContextCount (default 4)
@@ -96,8 +101,10 @@ struct flagcxDevCommInternal {
   // struct had no reader and would invite the generic teardown path to free
   // symmetric-heap memory with the wrong allocator.
   // Host-only: communicator registrations installed for these buffers.
-  // Non-null only when this DevComm created the registration and therefore
-  // must deregister it before freeing the backing allocation.
+  // Signal ownership is tracked by backing-buffer identity because an IPC-only
+  // registration is valid even when no network MR handle exists.
+  void *ownedSignalBuffer;
+  // Network registration installed together with ownedSignalBuffer, if any.
   struct flagcxOneSideHandleInfo *ownedSignalRegistration;
   void *putValueStagingBuffer; // 8 bytes host-pinned, MR registered
   struct flagcxOneSideHandleInfo *ownedStagingRegistration;
@@ -112,6 +119,7 @@ struct flagcxDevCommInternal {
   // ---- P2P signal IPC pointers (intra-node direct atomic path) ----
   uint64_t **signalPeerPtrs; // Device array: [localRanks] → peer signal bufs
   int signalIpcSlot; // IPC table slot for signal peer pointers (-1 if not used)
+  void **completionSignalPeerPtrs;
 
   // ---- Vendor device comm (set if adaptor->devCommCreate succeeds, else NULL)
   // ----

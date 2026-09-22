@@ -78,7 +78,8 @@ jobs:
     name: torch-api-test (hygon)
     runs-on: [hg-8g-cicd-flagcx]
     container:
-      image: harbor.baai.ac.cn/flagos-dev/flagcx:b079886-hygon-dev
+      # Same digest as .github/configs/hygon.yml; see the comment there.
+      image: harbor.baai.ac.cn/flagos-dev/flagcx@sha256:00db17623d118e5c9c7788799c67c36a430d4d43550fc0f42476001e353a4140
       volumes:
         - /usr/local/hyhal:/opt/hyhal:ro
       options: >-
@@ -323,3 +324,43 @@ jobs:
           export FLAGCX_DEBUG=TRACE
           export FLAGCX_DEBUG_SUBSYS=ALL
           bash torch_api_test.sh
+
+  torch-api-test-ppu:
+    name: torch-api-test (ppu)
+    runs-on: [flagcicd-810e]
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          ssh-strict: true
+          ssh-user: git
+          persist-credentials: true
+          clean: true
+          sparse-checkout-cone-mode: true
+          fetch-tags: false
+          show-progress: true
+          lfs: false
+          submodules: recursive
+          set-safe-directory: true
+
+      - name: Check Docker
+        shell: bash
+        run: docker version
+
+      - name: Run PPU Torch API tests
+        shell: bash
+        env:
+          FLAGCX_CI_CONTAINER_NAME: flagcx-ppu-torch-${{ github.run_id }}-${{ github.run_attempt }}
+          FLAGCX_CI_IMAGE: harbor.baai.ac.cn/flagos-dev/flagcx:manual-20260827-ppu-dev
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/ci/run_ppu_container.sh" torch-api
+
+      - name: Cleanup PPU Torch API container
+        if: always()
+        shell: bash
+        env:
+          FLAGCX_CI_CONTAINER_NAME: flagcx-ppu-torch-${{ github.run_id }}-${{ github.run_attempt }}
+        run: docker rm --force "$FLAGCX_CI_CONTAINER_NAME" >/dev/null 2>&1 || true

@@ -1,6 +1,6 @@
-#include "iluvatar_corex_adaptor.h"
+#include "iluvatar_adaptor.h"
 
-#ifdef USE_ILUVATAR_COREX_ADAPTOR
+#ifdef USE_ILUVATAR_ADAPTOR
 
 #include "adaptor.h"
 #include "alloc.h"
@@ -445,5 +445,6 @@ struct flagcxDeviceAdaptor ixcudaAdaptor {
       ixcudaAdaptorSymMulticastFree,
       NULL, // flagcxResult_t (*getLastError)();
       flagcxDeviceAdaptorGetPointerTypeNotSupported,
+      flagcxDeviceAdaptorGetAddressRangeNotSupported,
 };
-#endif // USE_ILUVATAR_COREX_ADAPTOR
+#endif // USE_ILUVATAR_ADAPTOR

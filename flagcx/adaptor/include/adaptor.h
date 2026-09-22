@@ -64,15 +64,19 @@ extern struct flagcxNetAdaptor *netAdaptor;
 
 // Network type enumeration
 enum NetType {
-  IBRC = 1,   // InfiniBand RC (or UCX when USE_UCX=1)
+  RDMA = 1,   // Build-selected RDMA-class network adaptor
   SOCKET = 2, // Socket
 #ifdef USE_IBUC
   IBUC = 3, // InfiniBand UC
 #endif
 };
 
-// Unified network adaptor function declarations
-struct flagcxNetAdaptor *getUnifiedNetAdaptor(int netType);
+// Build-selected network adaptor function declaration
+struct flagcxNetAdaptor *getNetAdaptor(int netType);
+
+/* Compatibility name retained for existing deployments.  The setting
+ * disables the build-selected RDMA-class adaptor, not only the IBRC backend. */
+int64_t flagcxParamIbDisable(void);
 
 inline bool flagcxCCLAdaptorNeedSendrecv(size_t value) { return value != 0; }
 
